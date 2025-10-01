@@ -1,12 +1,12 @@
-# Noise models in image processing
-
+# streamlit_image_noise_app_fixed.py
+# Noise models in image processing (fixed)
 # Comprehensive Streamlit app for image noise processing
 # Features: Noise Identification & Removal, Noise Addition & Filtering,
 # Noise Description & Education with dynamic PDF export
 
 import io
 import math
-from typing import Tuple
+from typing import Tuple, Dict
 
 import numpy as np
 import cv2
@@ -19,6 +19,7 @@ from skimage.metrics import peak_signal_noise_ratio as psnr
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.pagesizes import letter
+from datetime import datetime
 
 # -------------------------------
 # Utility and caching
@@ -46,23 +47,32 @@ def to_8bit_gray(arr: np.ndarray) -> np.ndarray:
         return cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
     return arr
 
+
+def ensure_odd(k: int) -> int:
+    if k % 2 == 0:
+        return k + 1
+    return k
+
+
 # -------------------------------
 # Noise generation functions
 # -------------------------------
 
 
 def add_gaussian_noise(image: np.ndarray, sigma: float) -> np.ndarray:
-    out = random_noise(image, mode='gaussian', var=(sigma/255.0)**2)
+    # sigma provided in [0..255] units
+    var = (sigma / 255.0) ** 2
+    out = random_noise(image, mode='gaussian', var=var, seed=None)
     return (out * 255).astype(np.uint8)
 
 
 def add_salt_pepper(image: np.ndarray, amount: float) -> np.ndarray:
-    out = random_noise(image, mode='s&p', amount=amount)
+    out = random_noise(image, mode='s&p', amount=amount, seed=None)
     return (out * 255).astype(np.uint8)
 
 
 def add_poisson_noise(image: np.ndarray) -> np.ndarray:
-    out = random_noise(image, mode='poisson')
+    out = random_noise(image, mode='poisson', seed=None)
     return (out * 255).astype(np.uint8)
 
 
@@ -101,19 +111,24 @@ def add_quantization_noise(image: np.ndarray, levels: int) -> np.ndarray:
 def add_colored_noise(image: np.ndarray, intensity: float, freqs: Tuple[float, float] = (5, 5)) -> np.ndarray:
     # generate low-frequency colored noise using gaussian blur on white noise
     h, w = image.shape[:2]
-    noise = np.random.randn(h, w, 1)
-    noise = cv2.GaussianBlur(noise, (0, 0), sigmaX=freqs[0], sigmaY=freqs[1])
+    noise = np.random.randn(h, w, 1).astype(np.float32)
+    # sigmaX/Y should be positive and not zero
+    sigma_x = max(1.0, float(freqs[0]))
+    sigma_y = max(1.0, float(freqs[1]))
+    noise = cv2.GaussianBlur(noise, (0, 0), sigmaX=sigma_x, sigmaY=sigma_y)
     noise = noise / (np.std(noise) + 1e-9) * intensity
     if image.ndim == 3:
         noise = np.repeat(noise, 3, axis=2)
-    out = image.astype(float) + noise * 255
+    out = image.astype(float) + noise * 255.0
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
 def add_photon_noise(image: np.ndarray, scale: float) -> np.ndarray:
-    # model photon as Poisson with scaling
+    # model photon as Poisson with scaling; scale should be small for realistic behaviour
     img_float = image.astype(np.float32) / 255.0
-    vals = np.random.poisson(img_float * (1/scale)) * scale
+    # avoid division by zero; scale controls intensity of poisson sampling
+    lam = np.clip(img_float * (1.0 / max(scale, 1e-6)), 0.0, 1e6)
+    vals = np.random.poisson(lam) * max(scale, 1e-6)
     return np.clip(vals * 255.0, 0, 255).astype(np.uint8)
 
 
@@ -140,14 +155,16 @@ NOISE_ADD_FUNCTIONS = {
 
 
 def apply_median(img: np.ndarray, ksize: int) -> np.ndarray:
-    return cv2.medianBlur(img, ksize)
+    k = ensure_odd(max(1, ksize))
+    # cv2.medianBlur accepts single-channel or 3-channel 8-bit images
+    return cv2.medianBlur(img, k)
 
 
 def apply_adaptive_median(img: np.ndarray, max_ksize: int) -> np.ndarray:
     # naive adaptive median: try increasing kernel sizes until median reduces impulses
     gray = to_8bit_gray(img)
     out = gray.copy()
-    for k in range(3, max_ksize+1, 2):
+    for k in range(3, max_ksize + 1, 2):
         med = cv2.medianBlur(out, k)
         diff = np.abs(out - med)
         threshold = 0
@@ -159,43 +176,55 @@ def apply_adaptive_median(img: np.ndarray, max_ksize: int) -> np.ndarray:
 
 
 def apply_gaussian_blur(img: np.ndarray, ksize: int, sigma: float) -> np.ndarray:
-    if ksize % 2 == 0:
-        ksize += 1
-    return cv2.GaussianBlur(img, (ksize, ksize), sigma)
+    k = ensure_odd(max(1, ksize))
+    return cv2.GaussianBlur(img, (k, k), sigma)
 
 
 def apply_wiener(img: np.ndarray, mysize: Tuple[int, int] = (5, 5)) -> np.ndarray:
-    # scikit-image wiener expects grayscale but works on float
-    arr = img.astype(np.float32) / 255.0
-    if arr.ndim == 3:
-        channels = []
-        for c in range(3):
-            ch = restoration.wiener(arr[..., c], np.ones(mysize), balance=0.1)
-            channels.append(ch)
-        out = np.stack(channels, axis=-1)
-    else:
-        out = restoration.wiener(arr, np.ones(mysize), balance=0.1)
-    return np.clip(out * 255, 0, 255).astype(np.uint8)
+    # Use Wiener as a per-channel operation; fallback to Gaussian if Wiener fails
+    try:
+        arr = img.astype(np.float32) / 255.0
+        if arr.ndim == 3:
+            channels = []
+            for c in range(3):
+                ch = restoration.wiener(
+                    arr[..., c], np.ones(mysize), balance=0.1)
+                channels.append(ch)
+            out = np.stack(channels, axis=-1)
+        else:
+            out = restoration.wiener(arr, np.ones(mysize), balance=0.1)
+        return np.clip(out * 255.0, 0, 255).astype(np.uint8)
+    except Exception:
+        # safe fallback: small gaussian blur
+        return apply_gaussian_blur(img, ksize=max(mysize), sigma=1.0)
 
 
 def apply_nlm(img: np.ndarray, h: float = 0.8, patch_size: int = 7, patch_distance: int = 11) -> np.ndarray:
     arr = img.astype(np.float32) / 255.0
-    sigma_est = np.mean(estimate_sigma(arr, multichannel=True))
+    # estimate sigma with channel_axis
+    try:
+        sigma_est = np.mean(estimate_sigma(arr, channel_axis=-1))
+    except TypeError:
+        # older API fallback (if installed)
+        sigma_est = np.mean(estimate_sigma(arr, multichannel=True))
     patch_kw = dict(patch_size=patch_size,
-                    patch_distance=patch_distance, multichannel=True)
+                    patch_distance=patch_distance, channel_axis=-1)
     den = denoise_nl_means(arr, h=h * sigma_est, fast_mode=True, **patch_kw)
     return (np.clip(den, 0, 1) * 255).astype(np.uint8)
 
 
 def apply_wavelet_denoise(img: np.ndarray, sigma: float = 0.1) -> np.ndarray:
     arr = img.astype(np.float32) / 255.0
-    den = denoise_wavelet(
-        arr, sigma=sigma, multichannel=True, convert2ycbcr=True)
+    try:
+        den = denoise_wavelet(
+            arr, sigma=sigma, channel_axis=-1, convert2ycbcr=True)
+    except TypeError:
+        den = denoise_wavelet(
+            arr, sigma=sigma, multichannel=True, convert2ycbcr=True)
     return (np.clip(den, 0, 1) * 255).astype(np.uint8)
 
+
 # Lee filter implementation for multiplicative noise (speckle)
-
-
 def lee_filter(img: np.ndarray, size: int = 7) -> np.ndarray:
     img = img.astype(np.float32)
     if img.ndim == 3:
@@ -204,16 +233,15 @@ def lee_filter(img: np.ndarray, size: int = 7) -> np.ndarray:
             out[..., c] = lee_filter(img[..., c], size)
         return np.clip(out, 0, 255).astype(np.uint8)
     mean = cv2.blur(img, (size, size))
-    mean_sq = cv2.blur(img*img, (size, size))
-    var = mean_sq - mean*mean
+    mean_sq = cv2.blur(img * img, (size, size))
+    var = mean_sq - mean * mean
     overall_var = np.mean(var)
     k = var / (var + overall_var + 1e-9)
     result = mean + k * (img - mean)
     return np.clip(result, 0, 255).astype(np.uint8)
 
+
 # Frost filter approximation using exponential weighting
-
-
 def frost_filter(img: np.ndarray, size: int = 7, damping: int = 2) -> np.ndarray:
     img = img.astype(np.float32)
     if img.ndim == 3:
@@ -227,10 +255,10 @@ def frost_filter(img: np.ndarray, size: int = 7, damping: int = 2) -> np.ndarray
     out = np.zeros_like(img)
     for i in range(h):
         for j in range(w):
-            local = padded[i:i+size, j:j+size]
+            local = padded[i:i + size, j:j + size]
             local_mean = np.mean(local)
             local_var = np.var(local)
-            center = padded[i+pad, j+pad]
+            center = padded[i + pad, j + pad]
             if local_var < 1e-9:
                 out[i, j] = center
             else:
@@ -263,7 +291,7 @@ FILTER_MAP = {
 # -------------------------------
 
 
-def generate_pdf_report(images: dict, summary_text: str) -> bytes:
+def generate_pdf_report(images: Dict[str, np.ndarray], summary_text: str) -> bytes:
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter)
     styles = getSampleStyleSheet()
@@ -285,6 +313,7 @@ def generate_pdf_report(images: dict, summary_text: str) -> bytes:
     doc.build(story)
     buffer.seek(0)
     return buffer.read()
+
 
 # -------------------------------
 # Educational content
@@ -320,13 +349,13 @@ NOISE_DESCRIPTIONS = {
         'desc': 'Noise following exponential distribution, typically positive with decaying probability.',
         'model': 'Exp(λ)',
         'sources': 'Photon arrival times, queuing systems, random event arrivals',
-        'filters': 'Histogram equalization, variance-stabilizing transforms',
+        'filters': 'Median, wavelet denoising, variance stabilizing transforms',
     },
     'Rayleigh': {
         'desc': 'Noise following Rayleigh distribution, often arises in scattered signals.',
         'model': 'Rayleigh(σ)',
         'sources': 'Radar backscatter, wireless communication channels',
-        'filters': 'Adaptive thresholding, Bayesian filters, wavelet shrinkage',
+        'filters': 'Adaptive thresholding, Frost/Lee, wavelet shrinkage',
     },
     'Uniform': {
         'desc': 'Noise with equal probability across a given range.',
@@ -344,9 +373,33 @@ NOISE_DESCRIPTIONS = {
         'desc': 'Noise with non-flat power spectrum, e.g. pink noise, brown noise.',
         'model': 'Correlated spectrum-shaped noise',
         'sources': 'Biological signals, natural systems, communication channels',
-    }
+        'filters': 'Spectral subtraction, adaptive filtering',
+    },
+    'Additive': {
+        'desc': 'Noise that simply adds to the original image.',
+        'model': 'I(x) + N(x)',
+        'sources': 'Sensor electronics, thermal fluctuations',
+        'filters': 'Averaging, Wiener, non-local means',
+    },
+    'Multiplicative': {
+        'desc': 'Noise that multiplies the original image signal.',
+        'model': 'I(x) * N(x)',
+        'sources': 'Speckle in radar, ultrasound imaging',
+        'filters': 'Lee filter, Frost filter, homomorphic filtering',
+    },
+    'Quantization': {
+        'desc': 'Noise from rounding during digitization, limited precision.',
+        'model': 'Q(I(x)) - I(x)',
+        'sources': 'Analog-to-digital conversion',
+        'filters': 'Dithering, oversampling, error diffusion',
+    },
+    'Photon': {
+        'desc': 'Noise due to statistical variation in photon arrival (shot noise).',
+        'model': 'Poisson-distributed photon counts',
+        'sources': 'Low-light photography, astronomy, microscopy',
+        'filters': 'Variance-stabilizing transforms, denoising autoencoders',
+    },
 }
-
 
 # -------------------------------
 # UI Components
@@ -357,13 +410,15 @@ def show_image_columns(images: list, captions: list):
     n = len(images)
     cols = st.columns(n)
     for i, col in enumerate(cols):
-        col.image(images[i], use_container_width=True, caption=captions[i])
+        # use new width parameter API: 'stretch' mimics previous use_container_width=True
+        col.image(images[i], caption=captions[i], width='stretch')
 
 
 # Sidebar navigation
 st.sidebar.title("Image Noise Lab")
 mode = st.sidebar.radio("Choose mode", [
-                        "Noise Identification & Removal", "Noise Addition & Filtering", "Noise Descriptions & Education"])
+    "Noise Identification & Removal", "Noise Addition & Filtering", "Noise Descriptions & Education"
+])
 
 # -------------------------------
 # Mode: Noise Identification & Removal
@@ -386,20 +441,21 @@ if mode == "Noise Identification & Removal":
 
         st.write("Original noisy image")
         col1, col2 = st.columns(2)
-        col1.image(img, caption='Noisy input', use_container_width=True)
+        col1.image(img, caption='Noisy input', width='stretch')
 
         filter_name, filter_func = FILTER_MAP.get(
             noise_type, ("Wiener", apply_wiener))
         st.write(f"Recommended filters: {filter_name}")
 
-        if st.button("Apply Filter") or preview:
+        apply_now = st.button("Apply Filter")
+        if apply_now or preview:
             with st.spinner("Applying filter..."):
                 # choose filter based on mapping heuristics
                 if filter_func == apply_median:
                     den = apply_median(img, ksize if ksize %
-                                       2 == 1 else ksize+1)
+                                       2 == 1 else ksize + 1)
                 elif filter_func == apply_wavelet_denoise:
-                    den = apply_wavelet_denoise(img, sigma/255.0)
+                    den = apply_wavelet_denoise(img, sigma / 255.0)
                 elif filter_func == apply_nlm:
                     den = apply_nlm(img, h=nlm_h, patch_size=7,
                                     patch_distance=11)
@@ -413,7 +469,7 @@ if mode == "Noise Identification & Removal":
                     den = apply_wiener(img, mysize=(ksize, ksize))
 
             col2.image(
-                den, caption=f'Denoised ({filter_name})', use_container_width=True)
+                den, caption=f'Denoised ({filter_name})', width='stretch')
 
             # metrics
             try:
@@ -443,39 +499,79 @@ elif mode == "Noise Addition & Filtering":
         noise_choice = st.sidebar.selectbox(
             "Noise to add", list(NOISE_ADD_FUNCTIONS.keys()))
         st.sidebar.markdown("Noise parameters")
-        # show parameter sliders depending on noise
-        param = st.sidebar.slider(
-            "Noise parameter (interpretation varies)", 0.0, 100.0, 10.0)
-        sp_amount = st.sidebar.slider("Salt & pepper amount", 0.0, 0.5, 0.05)
-        quant_levels = st.sidebar.slider("Quantization levels", 2, 256, 32)
 
-        # add noise
-        if st.button("Add noise"):
+        # Show only relevant sliders based on selection
+        # Default parameter placeholders
+        gaussian_sigma = None
+        sp_amount = None
+        quant_levels = None
+        uniform_param = None
+        colored_intensity = None
+        photon_scale = None
+        gamma_var = None
+        exponential_scale = None
+        rayleigh_scale = None
+
+        if noise_choice == 'Salt-and-Pepper':
+            sp_amount = st.sidebar.slider(
+                "Salt & pepper amount", 0.0, 0.5, 0.05)
+        elif noise_choice == 'Gaussian' or noise_choice == 'Additive noise':
+            gaussian_sigma = st.sidebar.slider(
+                "Gaussian sigma (0-100)", 0.0, 100.0, 10.0)
+        elif noise_choice == 'Poisson':
+            st.sidebar.write(
+                "Poisson noise has no continuous intensity slider (statistical).")
+        elif noise_choice == 'Gamma (Speckle)' or noise_choice == 'Multiplicative noise':
+            gamma_var = st.sidebar.slider(
+                "Gamma speckle variance (scale)", 0.0, 5.0, 0.5)
+        elif noise_choice == 'Exponential':
+            exponential_scale = st.sidebar.slider(
+                "Exponential scale", 0.0, 100.0, 10.0)
+        elif noise_choice == 'Rayleigh':
+            rayleigh_scale = st.sidebar.slider(
+                "Rayleigh scale", 0.0, 100.0, 10.0)
+        elif noise_choice == 'Uniform' or noise_choice == 'White noise':
+            uniform_param = st.sidebar.slider(
+                "Uniform amplitude (+/-)", 0.0, 100.0, 10.0)
+        elif noise_choice == 'Quantization noise':
+            quant_levels = st.sidebar.slider("Quantization levels", 2, 256, 32)
+        elif noise_choice == 'Colored noise':
+            colored_intensity = st.sidebar.slider(
+                "Colored noise intensity", 0.0, 100.0, 10.0)
+        elif noise_choice == 'Photon noise':
+            photon_scale = st.sidebar.slider(
+                "Photon noise scale (smaller = stronger effect)", 1e-4, 1.0, 0.01, format="%.4f")
+
+        # Add noise button
+        add_btn = st.button("Add noise")
+        if add_btn:
             with st.spinner("Adding noise..."):
                 if noise_choice == 'Salt-and-Pepper':
-                    noisy = add_salt_pepper(img, sp_amount)
-                elif noise_choice == 'Gaussian':
-                    noisy = add_gaussian_noise(img, param)
+                    noisy = add_salt_pepper(img, float(sp_amount))
+                elif noise_choice == 'Gaussian' or noise_choice == 'Additive noise':
+                    noisy = add_gaussian_noise(img, float(gaussian_sigma))
                 elif noise_choice == 'Poisson':
                     noisy = add_poisson_noise(img)
-                elif noise_choice == 'Gamma (Speckle)':
-                    noisy = add_speckle_gamma(img, param/10.0)
+                elif noise_choice == 'Gamma (Speckle)' or noise_choice == 'Multiplicative noise':
+                    noisy = add_speckle_gamma(img, float(gamma_var))
                 elif noise_choice == 'Exponential':
-                    noisy = add_exponential_noise(img, param)
+                    noisy = add_exponential_noise(
+                        img, float(exponential_scale))
                 elif noise_choice == 'Rayleigh':
-                    noisy = add_rayleigh_noise(img, param)
+                    noisy = add_rayleigh_noise(img, float(rayleigh_scale))
                 elif noise_choice == 'Uniform' or noise_choice == 'White noise':
-                    noisy = add_uniform_noise(img, -param, param)
+                    noisy = add_uniform_noise(
+                        img, -float(uniform_param), float(uniform_param))
                 elif noise_choice == 'Quantization noise':
-                    noisy = add_quantization_noise(img, quant_levels)
+                    noisy = add_quantization_noise(img, int(quant_levels))
                 elif noise_choice == 'Colored noise':
-                    noisy = add_colored_noise(img, param/50.0)
+                    noisy = add_colored_noise(img, float(colored_intensity))
                 elif noise_choice == 'Photon noise':
-                    noisy = add_photon_noise(img, max(1e-3, param/100.0))
+                    noisy = add_photon_noise(img, float(photon_scale))
                 else:
-                    noisy = add_gaussian_noise(img, param)
+                    noisy = add_gaussian_noise(img, 10.0)
 
-            # show images
+            # show images (use width='stretch' for responsive columns)
             st.write("Preview")
             show_image_columns([img, noisy], ['Original clean', 'Noisy'])
 
@@ -495,15 +591,27 @@ elif mode == "Noise Addition & Filtering":
                 elif filter_func == frost_filter:
                     den = frost_filter(noisy, size=7)
                 elif filter_func == apply_gaussian_blur:
+                    # Gaussian blur is a simple smoothing fallback
                     den = apply_gaussian_blur(noisy, 5, 1.0)
+                elif filter_func == apply_wiener:
+                    # For Gaussian noise, use a stronger gaussian blur fallback if Wiener misbehaves
+                    if noise_choice == 'Gaussian':
+                        # try Wiener first, fallback to gaussian blur
+                        try:
+                            den = apply_wiener(noisy, mysize=(5, 5))
+                        except Exception:
+                            den = apply_gaussian_blur(noisy, 5, 1.5)
+                    else:
+                        den = apply_wiener(noisy, mysize=(5, 5))
                 else:
                     den = apply_wiener(noisy, mysize=(5, 5))
 
             show_image_columns([img, noisy, den], [
                                'Original', 'Noisy', f'Denoised ({filter_name})'])
 
+            # allow downloading PDF report
             if st.button("Download PDF with examples"):
-                summary = f"Noise added: {noise_choice}. Parameter: {param}. Filter: {filter_name}."
+                summary = f"Noise added: {noise_choice}. Filter: {filter_name}. Generated: {datetime.utcnow().isoformat()}Z"
                 pdf_bytes = generate_pdf_report(
                     {'Original': img, 'Noisy': noisy, 'Denoised': den}, summary)
                 st.download_button("Download generated PDF", data=pdf_bytes,
@@ -544,3 +652,5 @@ else:
 st.sidebar.markdown("---")
 st.sidebar.caption(
     "Built with OpenCV, NumPy, scikit-image and ReportLab for education and prototyping.")
+st.sidebar.caption("© 2024 Image Noise Lab")
+st.sidebar.caption("Developed by Rafay Adeel")
