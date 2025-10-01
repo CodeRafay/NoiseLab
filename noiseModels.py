@@ -357,7 +357,7 @@ def show_image_columns(images: list, captions: list):
     n = len(images)
     cols = st.columns(n)
     for i, col in enumerate(cols):
-        col.image(images[i], use_column_width=True, caption=captions[i])
+        col.image(images[i], use_container_width=True, caption=captions[i])
 
 
 # Sidebar navigation
@@ -386,7 +386,7 @@ if mode == "Noise Identification & Removal":
 
         st.write("Original noisy image")
         col1, col2 = st.columns(2)
-        col1.image(img, caption='Noisy input', use_column_width=True)
+        col1.image(img, caption='Noisy input', use_container_width=True)
 
         filter_name, filter_func = FILTER_MAP.get(
             noise_type, ("Wiener", apply_wiener))
@@ -413,7 +413,7 @@ if mode == "Noise Identification & Removal":
                     den = apply_wiener(img, mysize=(ksize, ksize))
 
             col2.image(
-                den, caption=f'Denoised ({filter_name})', use_column_width=True)
+                den, caption=f'Denoised ({filter_name})', use_container_width=True)
 
             # metrics
             try:
