@@ -1,3 +1,4 @@
+# noise_addition_filtering.py for "Noise Addition and filtering" tab in app
 import streamlit as st
 import cv2
 import numpy as np
@@ -212,3 +213,4 @@ def run_noise_addition_filtering():
             st.subheader("Comparison")
             display_triplet(img, noisy, denoised, "Original",
                             f"Noisy ({noise_choice})", "Denoised")
+
