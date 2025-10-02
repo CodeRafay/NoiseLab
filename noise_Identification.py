@@ -1,4 +1,4 @@
-# noise_Identification.py
+# noise_Identification.py for "Noise Identification and removal" tab on app
 import streamlit as st
 import cv2
 import numpy as np
@@ -243,3 +243,4 @@ def run_noise_identification_removal():
     if denoised is not None:
         st.subheader("Comparison")
         display_comparison(img_rgb, denoised, noise_type)
+
