@@ -92,10 +92,6 @@ NoiseLab is ideal for:
 Contributions are welcome! Open issues or submit pull requests with enhancements, bug fixes, or additional noise models.  
 ---
 
-## Developed by RAFAY ADEEL
-
----
-
 ## 📜 License
 
 Apache 2.0 License © 2025
